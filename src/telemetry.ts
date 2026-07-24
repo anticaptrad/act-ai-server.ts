@@ -20,13 +20,11 @@ const sdk = new NodeSDK({
 
 sdk.start();
 
-// Flush spans on shutdown so nothing is lost when k8s sends SIGTERM.
-const shutdown = () => {
-  sdk
-    .shutdown()
-    .catch((err) => console.error('OpenTelemetry shutdown error', err))
-    .finally(() => process.exit(0));
-};
-
-process.once('SIGTERM', shutdown);
-process.once('SIGINT', shutdown);
+/** Flush and shut down the tracer so buffered spans are exported on exit. */
+export async function shutdownTelemetry(): Promise<void> {
+  try {
+    await sdk.shutdown();
+  } catch (err) {
+    console.error('OpenTelemetry shutdown error', err);
+  }
+}
