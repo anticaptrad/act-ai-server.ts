@@ -47,7 +47,8 @@ export async function generateScript(topic: string, provider: Provider): Promise
         messages: [{ role: 'user', content: prompt }],
       });
       // Guard against safety refusals (stop_reason: "refusal") before reading content.
-      if (response.stop_reason === 'refusal') {
+      // Cast: older SDK typings don't yet include the "refusal" stop reason.
+      if ((response.stop_reason as string) === 'refusal') {
         throw new Error('Anthropic declined the request');
       }
       const block = response.content[0];
