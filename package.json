@@ -1,0 +1,24 @@
+{
+  "name": "act-ai-server",
+  "version": "1.0.0",
+  "description": "AI API interactions server",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch & node dist/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.24.0",
+    "@google/generative-ai": "^0.1.1",
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/sdk-node": "^0.52.0",
+    "dotenv": "^16.4.5",
+    "fastify": "^4.28.1",
+    "openai": "^4.52.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.3"
+  }
+}
