@@ -3,7 +3,13 @@
 import { shutdownTelemetry } from './telemetry';
 
 import Fastify from 'fastify';
-import { generateScript, isProvider, type Provider } from './providers';
+import {
+  configuredProviders,
+  generateScript,
+  isProvider,
+  ProviderNotConfiguredError,
+  type Provider,
+} from './providers';
 import { uploadToYouTube } from './youtube';
 
 const fastify = Fastify({ logger: true });
