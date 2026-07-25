@@ -34,8 +34,8 @@ interface PublishRequest {
  * otherwise pass a plain truthiness check and be forwarded to a provider, which
  * costs a paid API call to answer nothing.
  */
-function isBlank(value: unknown): boolean {
-  return typeof value !== 'string' || value.trim().length === 0;
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
 }
 
 // Liveness probe.
@@ -53,7 +53,7 @@ fastify.get('/ready', async () => ({
 fastify.post('/api/generate/script', async (request, reply) => {
   const { topic, provider } = (request.body ?? {}) as Partial<ScriptRequest>;
 
-  if (!topic || !provider) {
+  if (!isNonEmptyString(topic) || !provider) {
     return reply.status(400).send({ error: 'Missing topic or provider' });
   }
   if (!isProvider(provider)) {
@@ -76,7 +76,7 @@ fastify.post('/api/generate/script', async (request, reply) => {
 fastify.post('/api/generate/video', async (request, reply) => {
   const { script } = (request.body ?? {}) as Partial<VideoRequest>;
 
-  if (!script) {
+  if (!isNonEmptyString(script)) {
     return reply.status(400).send({ error: 'Missing script' });
   }
 
@@ -93,7 +93,7 @@ fastify.post('/api/generate/video', async (request, reply) => {
 fastify.post('/api/publish/youtube', async (request, reply) => {
   const { filePath, title, description } = (request.body ?? {}) as Partial<PublishRequest>;
 
-  if (!filePath || !title) {
+  if (!isNonEmptyString(filePath) || !isNonEmptyString(title)) {
     return reply.status(400).send({ error: 'Missing filePath or title' });
   }
 
@@ -117,12 +117,34 @@ const start = async () => {
   }
 };
 
+// How long to let in-flight work finish before exiting anyway. Keep this below
+// the pod's terminationGracePeriodSeconds so we exit on our own terms rather
+// than being SIGKILLed.
+const SHUTDOWN_GRACE_MS = Number(process.env.SHUTDOWN_GRACE_MS ?? 10_000);
+
 // Drain in-flight requests, then flush telemetry, on k8s pod stop.
+//
+// The drain is bounded: `fastify.close()` waits for open connections to go
+// idle, and a client that never reads its response body keeps one active
+// indefinitely. Without a deadline a single such client would hold the pod open
+// until the kubelet SIGKILLed it, stalling every rolling update.
 const shutdown = async (signal: string) => {
   fastify.log.info(`${signal} received; shutting down`);
+
+  const forceExit = setTimeout(() => {
+    fastify.log.warn(
+      { graceMs: SHUTDOWN_GRACE_MS },
+      'grace period elapsed with connections still open; exiting anyway',
+    );
+    process.exit(0);
+  }, SHUTDOWN_GRACE_MS);
+  // Do not let the timer itself keep the event loop alive.
+  forceExit.unref();
+
   try {
     await fastify.close();
   } finally {
+    clearTimeout(forceExit);
     await shutdownTelemetry();
     process.exit(0);
   }
