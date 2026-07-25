@@ -10,6 +10,7 @@ import {
   ProviderNotConfiguredError,
   type Provider,
 } from './providers';
+import { requireServerAuth, isAuthConfigured } from './auth';
 import {
   uploadToYouTube,
   classifyYouTubeError,
@@ -18,6 +19,11 @@ import {
 } from './youtube';
 
 const fastify = Fastify({ logger: true });
+
+// Guards every /api/* route. Registered before the routes so nothing can be
+// added later that quietly bypasses it — probes stay public because the hook
+// only matches the /api/ prefix.
+fastify.addHook('onRequest', requireServerAuth);
 
 interface ScriptRequest {
   topic: string;
@@ -55,6 +61,7 @@ fastify.get('/ready', async () => ({
   // Publishing is optional like the providers: reported for observability,
   // never a readiness gate.
   youtube: isYouTubeConfigured() ? 'configured' : 'not configured',
+  auth: isAuthConfigured() ? 'configured' : 'not configured',
 }));
 
 // Generate a video script with the selected LLM provider.
@@ -121,6 +128,12 @@ const start = async () => {
   try {
     // Surface an unconfigured publishing path once at boot rather than only on
     // the first upload attempt.
+    if (!isAuthConfigured()) {
+      fastify.log.warn(
+        'SERVER_AUTH_SECRET not set; /api/* will answer 503 (paid and publishing routes stay closed)',
+      );
+    }
+
     const missingYouTube = missingYouTubeConfig();
     if (missingYouTube.length > 0) {
       fastify.log.warn(

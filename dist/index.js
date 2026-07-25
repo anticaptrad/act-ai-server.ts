@@ -8,8 +8,13 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const telemetry_1 = require("./telemetry");
 const fastify_1 = __importDefault(require("fastify"));
 const providers_1 = require("./providers");
+const auth_1 = require("./auth");
 const youtube_1 = require("./youtube");
 const fastify = (0, fastify_1.default)({ logger: true });
+// Guards every /api/* route. Registered before the routes so nothing can be
+// added later that quietly bypasses it — probes stay public because the hook
+// only matches the /api/ prefix.
+fastify.addHook('onRequest', auth_1.requireServerAuth);
 /**
  * A required text field must be a non-blank string. Whitespace-only input would
  * otherwise pass a plain truthiness check and be forwarded to a provider, which
@@ -29,6 +34,7 @@ fastify.get('/ready', async () => ({
     // Publishing is optional like the providers: reported for observability,
     // never a readiness gate.
     youtube: (0, youtube_1.isYouTubeConfigured)() ? 'configured' : 'not configured',
+    auth: (0, auth_1.isAuthConfigured)() ? 'configured' : 'not configured',
 }));
 // Generate a video script with the selected LLM provider.
 fastify.post('/api/generate/script', async (request, reply) => {
@@ -86,6 +92,9 @@ const start = async () => {
     try {
         // Surface an unconfigured publishing path once at boot rather than only on
         // the first upload attempt.
+        if (!(0, auth_1.isAuthConfigured)()) {
+            fastify.log.warn('SERVER_AUTH_SECRET not set; /api/* will answer 503 (paid and publishing routes stay closed)');
+        }
         const missingYouTube = (0, youtube_1.missingYouTubeConfig)();
         if (missingYouTube.length > 0) {
             fastify.log.warn({ missing: missingYouTube }, 'YouTube publishing is not configured; /api/publish/youtube will answer 503');

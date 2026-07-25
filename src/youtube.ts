@@ -52,6 +52,21 @@ const PRIVACY_STATUSES = new Set(['private', 'unlisted', 'public']);
 
 const MAX_UPLOAD_BYTES = Number(process.env.YOUTUBE_MAX_UPLOAD_BYTES ?? 5 * 1024 * 1024 * 1024);
 
+/**
+ * The channel these credentials are expected to own.
+ *
+ * A refresh token names an account, not a channel, and nothing in the upload
+ * call says which channel it lands on. Swap in a token for a different Google
+ * account — a stale secret, a copy-paste from another project, a shared
+ * dev/prod mixup — and uploads silently publish to a stranger's channel under
+ * our titles. Checking identity once before the first upload turns that from a
+ * public mistake into a startup error.
+ *
+ * Unset disables the check.
+ */
+const EXPECTED_CHANNEL_ID = process.env.YOUTUBE_CHANNEL_ID ?? '';
+const EXPECTED_CHANNEL_HANDLE = process.env.YOUTUBE_CHANNEL_HANDLE ?? '';
+
 export function missingYouTubeConfig(): string[] {
   return REQUIRED_ENV.filter((name) => !process.env[name]);
 }
@@ -123,6 +138,63 @@ export async function resolveUploadPath(filePath: string): Promise<string> {
   return real;
 }
 
+export interface ChannelIdentity {
+  id: string;
+  title: string;
+  handle?: string;
+}
+
+let verifiedChannel: ChannelIdentity | undefined;
+
+/**
+ * Confirm the configured credentials own the channel we expect.
+ *
+ * Cached after the first success: channel identity does not change for the life
+ * of a token, and re-checking would spend a quota unit per upload.
+ */
+export async function verifyChannel(): Promise<ChannelIdentity> {
+  if (verifiedChannel) return verifiedChannel;
+
+  const youtube = getYouTube();
+  const res = await youtube.channels.list({ part: ['id', 'snippet'], mine: true });
+  const channel = res.data.items?.[0];
+  if (!channel?.id) {
+    throw new YouTubePublishError('credentials own no YouTube channel', 503);
+  }
+
+  const identity: ChannelIdentity = {
+    id: channel.id,
+    title: channel.snippet?.title ?? '',
+    handle: channel.snippet?.customUrl ?? undefined,
+  };
+
+  const normalize = (value: string) => value.replace(/^@/, '').toLowerCase();
+  const idMismatch = EXPECTED_CHANNEL_ID && EXPECTED_CHANNEL_ID !== identity.id;
+  const handleMismatch =
+    EXPECTED_CHANNEL_HANDLE &&
+    identity.handle &&
+    normalize(EXPECTED_CHANNEL_HANDLE) !== normalize(identity.handle);
+
+  if (idMismatch || handleMismatch) {
+    // Names the channel we landed on so the mixup is obvious, but refuses to
+    // upload. Publishing to the wrong channel is not recoverable by deleting.
+    throw new YouTubePublishError(
+      `credentials belong to a different channel: got ${identity.id}` +
+        `${identity.handle ? ` (${identity.handle})` : ''}, expected ` +
+        `${EXPECTED_CHANNEL_ID || EXPECTED_CHANNEL_HANDLE}`,
+      503,
+    );
+  }
+
+  verifiedChannel = identity;
+  return identity;
+}
+
+/** Forget the cached identity. Tests use this; production never needs it. */
+export function resetChannelCache(): void {
+  verifiedChannel = undefined;
+}
+
 export interface UploadOptions {
   privacyStatus?: string;
   tags?: string[];
@@ -137,6 +209,9 @@ export async function uploadToYouTube(
   options: UploadOptions = {},
 ): Promise<string> {
   const youtube = getYouTube();
+  // Identity first: a path that resolves is no use if the token points at the
+  // wrong channel.
+  await verifyChannel();
   const resolved = await resolveUploadPath(filePath);
   const { size } = await fsp.stat(resolved);
 
