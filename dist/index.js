@@ -10,6 +10,14 @@ const fastify_1 = __importDefault(require("fastify"));
 const providers_1 = require("./providers");
 const youtube_1 = require("./youtube");
 const fastify = (0, fastify_1.default)({ logger: true });
+/**
+ * A required text field must be a non-blank string. Whitespace-only input would
+ * otherwise pass a plain truthiness check and be forwarded to a provider, which
+ * costs a paid API call to answer nothing.
+ */
+function isNonEmptyString(value) {
+    return typeof value === 'string' && value.trim().length > 0;
+}
 // Liveness probe.
 fastify.get('/health', async () => ({ status: 'ok' }));
 // Readiness probe. Provider credentials are reported for observability but do
@@ -22,7 +30,7 @@ fastify.get('/ready', async () => ({
 // Generate a video script with the selected LLM provider.
 fastify.post('/api/generate/script', async (request, reply) => {
     const { topic, provider } = (request.body ?? {});
-    if (!topic || !provider) {
+    if (!isNonEmptyString(topic) || !provider) {
         return reply.status(400).send({ error: 'Missing topic or provider' });
     }
     if (!(0, providers_1.isProvider)(provider)) {
@@ -43,7 +51,7 @@ fastify.post('/api/generate/script', async (request, reply) => {
 // Generate a video from a script (placeholder for the video-generation API).
 fastify.post('/api/generate/video', async (request, reply) => {
     const { script } = (request.body ?? {});
-    if (!script) {
+    if (!isNonEmptyString(script)) {
         return reply.status(400).send({ error: 'Missing script' });
     }
     request.log.info('Triggering video generation with script payload');
@@ -56,7 +64,7 @@ fastify.post('/api/generate/video', async (request, reply) => {
 // Publish a rendered video file to YouTube.
 fastify.post('/api/publish/youtube', async (request, reply) => {
     const { filePath, title, description } = (request.body ?? {});
-    if (!filePath || !title) {
+    if (!isNonEmptyString(filePath) || !isNonEmptyString(title)) {
         return reply.status(400).send({ error: 'Missing filePath or title' });
     }
     try {

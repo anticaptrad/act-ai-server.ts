@@ -29,6 +29,15 @@ interface PublishRequest {
   description: string;
 }
 
+/**
+ * A required text field must be a non-blank string. Whitespace-only input would
+ * otherwise pass a plain truthiness check and be forwarded to a provider, which
+ * costs a paid API call to answer nothing.
+ */
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
 // Liveness probe.
 fastify.get('/health', async () => ({ status: 'ok' }));
 
@@ -44,7 +53,7 @@ fastify.get('/ready', async () => ({
 fastify.post('/api/generate/script', async (request, reply) => {
   const { topic, provider } = (request.body ?? {}) as Partial<ScriptRequest>;
 
-  if (!topic || !provider) {
+  if (!isNonEmptyString(topic) || !provider) {
     return reply.status(400).send({ error: 'Missing topic or provider' });
   }
   if (!isProvider(provider)) {
@@ -67,7 +76,7 @@ fastify.post('/api/generate/script', async (request, reply) => {
 fastify.post('/api/generate/video', async (request, reply) => {
   const { script } = (request.body ?? {}) as Partial<VideoRequest>;
 
-  if (!script) {
+  if (!isNonEmptyString(script)) {
     return reply.status(400).send({ error: 'Missing script' });
   }
 
@@ -84,7 +93,7 @@ fastify.post('/api/generate/video', async (request, reply) => {
 fastify.post('/api/publish/youtube', async (request, reply) => {
   const { filePath, title, description } = (request.body ?? {}) as Partial<PublishRequest>;
 
-  if (!filePath || !title) {
+  if (!isNonEmptyString(filePath) || !isNonEmptyString(title)) {
     return reply.status(400).send({ error: 'Missing filePath or title' });
   }
 
