@@ -10,7 +10,12 @@ import {
   ProviderNotConfiguredError,
   type Provider,
 } from './providers';
-import { uploadToYouTube } from './youtube';
+import {
+  uploadToYouTube,
+  classifyYouTubeError,
+  isYouTubeConfigured,
+  missingYouTubeConfig,
+} from './youtube';
 
 const fastify = Fastify({ logger: true });
 
@@ -47,6 +52,9 @@ fastify.get('/health', async () => ({ status: 'ok' }));
 fastify.get('/ready', async () => ({
   ready: true,
   providers: configuredProviders(),
+  // Publishing is optional like the providers: reported for observability,
+  // never a readiness gate.
+  youtube: isYouTubeConfigured() ? 'configured' : 'not configured',
 }));
 
 // Generate a video script with the selected LLM provider.
@@ -102,12 +110,25 @@ fastify.post('/api/publish/youtube', async (request, reply) => {
     return { videoId, url: `https://youtu.be/${videoId}` };
   } catch (error) {
     request.log.error(error);
-    return reply.status(502).send({ error: 'YouTube upload failed' });
+    // Distinguish "not configured", "bad request", "quota", and "credentials
+    // revoked" — they need different responses from whoever is on call.
+    const { status, message } = classifyYouTubeError(error);
+    return reply.status(status).send({ error: message });
   }
 });
 
 const start = async () => {
   try {
+    // Surface an unconfigured publishing path once at boot rather than only on
+    // the first upload attempt.
+    const missingYouTube = missingYouTubeConfig();
+    if (missingYouTube.length > 0) {
+      fastify.log.warn(
+        { missing: missingYouTube },
+        'YouTube publishing is not configured; /api/publish/youtube will answer 503',
+      );
+    }
+
     const port = parseInt(process.env.PORT ?? '3000', 10);
     await fastify.listen({ port, host: '0.0.0.0' });
   } catch (err) {

@@ -26,6 +26,9 @@ fastify.get('/health', async () => ({ status: 'ok' }));
 fastify.get('/ready', async () => ({
     ready: true,
     providers: (0, providers_1.configuredProviders)(),
+    // Publishing is optional like the providers: reported for observability,
+    // never a readiness gate.
+    youtube: (0, youtube_1.isYouTubeConfigured)() ? 'configured' : 'not configured',
 }));
 // Generate a video script with the selected LLM provider.
 fastify.post('/api/generate/script', async (request, reply) => {
@@ -73,11 +76,20 @@ fastify.post('/api/publish/youtube', async (request, reply) => {
     }
     catch (error) {
         request.log.error(error);
-        return reply.status(502).send({ error: 'YouTube upload failed' });
+        // Distinguish "not configured", "bad request", "quota", and "credentials
+        // revoked" — they need different responses from whoever is on call.
+        const { status, message } = (0, youtube_1.classifyYouTubeError)(error);
+        return reply.status(status).send({ error: message });
     }
 });
 const start = async () => {
     try {
+        // Surface an unconfigured publishing path once at boot rather than only on
+        // the first upload attempt.
+        const missingYouTube = (0, youtube_1.missingYouTubeConfig)();
+        if (missingYouTube.length > 0) {
+            fastify.log.warn({ missing: missingYouTube }, 'YouTube publishing is not configured; /api/publish/youtube will answer 503');
+        }
         const port = parseInt(process.env.PORT ?? '3000', 10);
         await fastify.listen({ port, host: '0.0.0.0' });
     }
