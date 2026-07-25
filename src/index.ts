@@ -32,8 +32,13 @@ interface PublishRequest {
 // Liveness probe.
 fastify.get('/health', async () => ({ status: 'ok' }));
 
-// Readiness probe.
-fastify.get('/ready', async () => ({ ready: true }));
+// Readiness probe. Provider credentials are reported for observability but do
+// not gate readiness — the service still serves probes and non-LLM routes
+// without them.
+fastify.get('/ready', async () => ({
+  ready: true,
+  providers: configuredProviders(),
+}));
 
 // Generate a video script with the selected LLM provider.
 fastify.post('/api/generate/script', async (request, reply) => {
