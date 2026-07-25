@@ -28,15 +28,77 @@ const SCOPES = [
   'https://www.googleapis.com/auth/youtube.readonly',
 ];
 
-const CLIENT_ID = process.env.YOUTUBE_CLIENT_ID;
-const CLIENT_SECRET = process.env.YOUTUBE_CLIENT_SECRET;
-const OUT_PATH = process.env.YOUTUBE_TOKEN_OUT ?? path.join(process.env.HOME ?? '.', '.anticaptrad-youtube.json');
+const OUT_PATH =
+  process.env.YOUTUBE_TOKEN_OUT ?? path.join(process.env.HOME ?? '.', '.anticaptrad-youtube.json');
 
-if (!CLIENT_ID || !CLIENT_SECRET) {
-  console.error(
-    'Set YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET first (Desktop app OAuth client).',
+/**
+ * Locate the client credentials.
+ *
+ * Console hands you a `client_secret_*.json` download, so accept that directly
+ * rather than making anyone transcribe two long strings into env vars — a step
+ * that mostly produces typos. Explicit `--client-json` wins, then the
+ * environment, then the newest matching download.
+ */
+async function loadClientCredentials(argv) {
+  const flagIndex = argv.indexOf('--client-json');
+  const explicit = flagIndex >= 0 ? argv[flagIndex + 1] : undefined;
+
+  const fromFile = async (file) => {
+    const parsed = JSON.parse(await fs.readFile(file, 'utf8'));
+    // Desktop clients serialize under `installed`, web clients under `web`.
+    const block = parsed.installed ?? parsed.web ?? parsed;
+    if (!block.client_id || !block.client_secret) {
+      throw new Error(`${file} has no client_id/client_secret`);
+    }
+    if (!parsed.installed && parsed.web) {
+      console.warn(
+        '\nWarning: this is a WEB client. The loopback redirect below will be\n' +
+          'rejected unless it is registered. A Desktop client avoids that.\n',
+      );
+    }
+    return { clientId: block.client_id, clientSecret: block.client_secret, source: file };
+  };
+
+  if (explicit) return fromFile(explicit);
+
+  if (process.env.YOUTUBE_CLIENT_ID && process.env.YOUTUBE_CLIENT_SECRET) {
+    return {
+      clientId: process.env.YOUTUBE_CLIENT_ID,
+      clientSecret: process.env.YOUTUBE_CLIENT_SECRET,
+      source: 'environment',
+    };
+  }
+
+  const home = process.env.HOME ?? '.';
+  for (const dir of [path.join(home, 'Downloads'), path.join(home, 'Desktop'), process.cwd()]) {
+    let entries;
+    try {
+      entries = await fs.readdir(dir);
+    } catch {
+      continue;
+    }
+    const candidates = entries.filter(
+      (name) => name.startsWith('client_secret') && name.endsWith('.json'),
+    );
+    if (candidates.length === 0) continue;
+
+    // Newest wins, so re-downloading after a mistake does the obvious thing.
+    const withTimes = await Promise.all(
+      candidates.map(async (name) => {
+        const full = path.join(dir, name);
+        return { full, mtime: (await fs.stat(full)).mtimeMs };
+      }),
+    );
+    withTimes.sort((a, b) => b.mtime - a.mtime);
+    return fromFile(withTimes[0].full);
+  }
+
+  throw new Error(
+    'No client credentials found.\n' +
+      '  Create a Desktop OAuth client, download its JSON, then either:\n' +
+      '    node scripts/youtube-authorize.mjs --client-json <path>\n' +
+      '  or set YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET.',
   );
-  process.exit(2);
 }
 
 /** Open a URL in the user's browser. */
@@ -77,6 +139,10 @@ function awaitCode(server) {
 }
 
 async function main() {
+  const { clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, source } =
+    await loadClientCredentials(process.argv.slice(2));
+  console.log(`Using client credentials from: ${source}`);
+
   // Port 0 lets the OS pick; the exact port goes into the redirect URI, and
   // Desktop clients accept any loopback port.
   const server = createServer();
