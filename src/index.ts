@@ -56,6 +56,9 @@ fastify.post('/api/generate/script', async (request, reply) => {
     return { script };
   } catch (error) {
     request.log.error(error);
+    if (error instanceof ProviderNotConfiguredError) {
+      return reply.status(503).send({ error: error.message });
+    }
     return reply.status(502).send({ error: 'Script generation failed' });
   }
 });
