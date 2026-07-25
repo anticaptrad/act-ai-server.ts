@@ -29,6 +29,15 @@ interface PublishRequest {
   description: string;
 }
 
+/**
+ * A required text field must be a non-blank string. Whitespace-only input would
+ * otherwise pass a plain truthiness check and be forwarded to a provider, which
+ * costs a paid API call to answer nothing.
+ */
+function isBlank(value: unknown): boolean {
+  return typeof value !== 'string' || value.trim().length === 0;
+}
+
 // Liveness probe.
 fastify.get('/health', async () => ({ status: 'ok' }));
 
