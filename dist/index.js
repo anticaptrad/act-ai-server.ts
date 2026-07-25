@@ -12,8 +12,13 @@ const youtube_1 = require("./youtube");
 const fastify = (0, fastify_1.default)({ logger: true });
 // Liveness probe.
 fastify.get('/health', async () => ({ status: 'ok' }));
-// Readiness probe.
-fastify.get('/ready', async () => ({ ready: true }));
+// Readiness probe. Provider credentials are reported for observability but do
+// not gate readiness — the service still serves probes and non-LLM routes
+// without them.
+fastify.get('/ready', async () => ({
+    ready: true,
+    providers: (0, providers_1.configuredProviders)(),
+}));
 // Generate a video script with the selected LLM provider.
 fastify.post('/api/generate/script', async (request, reply) => {
     const { topic, provider } = (request.body ?? {});
@@ -29,6 +34,9 @@ fastify.post('/api/generate/script', async (request, reply) => {
     }
     catch (error) {
         request.log.error(error);
+        if (error instanceof providers_1.ProviderNotConfiguredError) {
+            return reply.status(503).send({ error: error.message });
+        }
         return reply.status(502).send({ error: 'Script generation failed' });
     }
 });
