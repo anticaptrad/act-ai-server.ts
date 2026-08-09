@@ -33,6 +33,8 @@ export interface ShutdownState {
   phase: ShutdownPhase;
   stdinIsTTY: boolean;
   firstTrigger: ShutdownTrigger | null;
+  /** Counts operating-system SIGINT/SIGTERM events only. */
+  signalCount: number;
 }
 
 export interface ShutdownTransition {
@@ -73,6 +75,8 @@ export interface ShutdownOptions {
   flush?: () => Promise<void> | void;
   logger: ShutdownLogger;
   graceMs?: number;
+  /** Maximum wait for force and telemetry hooks. Defaults to min(graceMs, 5s). */
+  forceMs?: number;
   processRef?: SignalSource;
   stdin?: ShutdownStdin;
   onComplete?: (outcome: ShutdownOutcome) => void;
@@ -91,7 +95,12 @@ export function initialState(stdinIsTTY: boolean): ShutdownState {
     phase: ShutdownPhase.Running,
     stdinIsTTY,
     firstTrigger: null,
+    signalCount: 0,
   };
+}
+
+function isSignal(trigger: ShutdownTrigger): boolean {
+  return trigger === ShutdownTrigger.Sigint || trigger === ShutdownTrigger.Sigterm;
 }
 
 export function transition(
@@ -99,7 +108,7 @@ export function transition(
   trigger: ShutdownTrigger,
 ): ShutdownTransition {
   if (state.phase === ShutdownPhase.Running) {
-    if (trigger !== ShutdownTrigger.Sigint && trigger !== ShutdownTrigger.Sigterm) {
+    if (!isSignal(trigger)) {
       return ignored(state);
     }
 
@@ -108,6 +117,7 @@ export function transition(
         ...state,
         phase: ShutdownPhase.Draining,
         firstTrigger: trigger,
+        signalCount: state.signalCount + 1,
       },
       action: ShutdownAction.BeginGraceful,
       showForceHint: state.stdinIsTTY && trigger === ShutdownTrigger.Sigint,
@@ -123,8 +133,7 @@ export function transition(
       };
     }
 
-    const signalForces =
-      trigger === ShutdownTrigger.Sigint || trigger === ShutdownTrigger.Sigterm;
+    const signalForces = isSignal(trigger);
     const eofForces =
       trigger === ShutdownTrigger.StdinEof &&
       state.stdinIsTTY &&
@@ -132,7 +141,11 @@ export function transition(
 
     if (trigger === ShutdownTrigger.Timeout || signalForces || eofForces) {
       return {
-        state: { ...state, phase: ShutdownPhase.Forcing },
+        state: {
+          ...state,
+          phase: ShutdownPhase.Forcing,
+          signalCount: state.signalCount + (signalForces ? 1 : 0),
+        },
         action: ShutdownAction.Force,
         showForceHint: false,
       };
@@ -162,13 +175,19 @@ function logFields(
     phase: state.phase,
     trigger,
     stdin_is_tty: state.stdinIsTTY,
+    signal_count: state.signalCount,
     grace_ms: graceMs,
     forced,
   };
 }
 
-function resolveGraceMs(logger: ShutdownLogger, configured?: number): number {
-  const raw = configured ?? Number(process.env.SHUTDOWN_GRACE_MS ?? 10_000);
+function resolvePositiveMillis(
+  logger: ShutdownLogger,
+  configured: number | undefined,
+  fallback: number,
+  field: string,
+): number {
+  const raw = configured ?? fallback;
   if (Number.isSafeInteger(raw) && raw > 0) {
     return raw;
   }
@@ -176,12 +195,13 @@ function resolveGraceMs(logger: ShutdownLogger, configured?: number): number {
   logger.warn(
     {
       event: 'shutdown_config_invalid',
-      configured_grace_ms: raw,
-      fallback_ms: 10_000,
+      field,
+      configured_ms: raw,
+      fallback_ms: fallback,
     },
-    'SHUTDOWN_GRACE_MS must be a positive integer; using the default',
+    `${field} must be a positive integer; using the default`,
   );
-  return 10_000;
+  return fallback;
 }
 
 function errorValue(error: unknown): Record<string, unknown> {
@@ -195,33 +215,67 @@ function errorValue(error: unknown): Record<string, unknown> {
   return { error };
 }
 
+async function withDeadline<T>(
+  operation: string,
+  milliseconds: number,
+  promise: Promise<T> | T,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve(promise),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${operation} exceeded ${milliseconds}ms`)),
+          milliseconds,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export function installShutdownHandlers(options: ShutdownOptions): ShutdownController {
   const processRef = options.processRef ?? process;
   const stdin = options.stdin ?? process.stdin;
   const flush = options.flush ?? (() => undefined);
   const onComplete = options.onComplete ?? (() => undefined);
-  const graceMs = resolveGraceMs(options.logger, options.graceMs);
+  const graceMs = resolvePositiveMillis(
+    options.logger,
+    options.graceMs ?? Number(process.env.SHUTDOWN_GRACE_MS ?? 10_000),
+    10_000,
+    'SHUTDOWN_GRACE_MS',
+  );
+  const forceMs = resolvePositiveMillis(
+    options.logger,
+    options.forceMs,
+    Math.min(graceMs, 5_000),
+    'shutdown force timeout',
+  );
 
   let state = initialState(Boolean(stdin.isTTY));
   let completionPromise: Promise<ShutdownOutcome> | null = null;
   let timer: NodeJS.Timeout | null = null;
   let eofArmed = false;
   let resumedStdin = false;
+  let flushPromise: Promise<void> | null = null;
   let resolveForce!: (trigger: ShutdownTrigger) => void;
 
   const forceRequested = new Promise<ShutdownTrigger>((resolve) => {
     resolveForce = resolve;
   });
 
+  const flushOnce = (): Promise<void> => {
+    flushPromise ??= Promise.resolve().then(() => flush());
+    return flushPromise;
+  };
+
   const cleanupListeners = () => {
     processRef.removeListener('SIGINT', onSigint);
     processRef.removeListener('SIGTERM', onSigterm);
-    if (eofArmed) {
-      stdin.removeListener('end', onEof);
-    }
-    if (resumedStdin && stdin.readableFlowing === true) {
-      stdin.pause();
-    }
+    if (eofArmed) stdin.removeListener('end', onEof);
+    if (resumedStdin && stdin.readableFlowing === true) stdin.pause();
     if (timer) {
       clearTimeout(timer);
       timer = null;
@@ -231,9 +285,7 @@ export function installShutdownHandlers(options: ShutdownOptions): ShutdownContr
   const requestForce = (trigger: ShutdownTrigger) => {
     const next = transition(state, trigger);
     state = next.state;
-    if (next.action !== ShutdownAction.Force) {
-      return;
-    }
+    if (next.action !== ShutdownAction.Force) return;
 
     options.logger.warn(
       logFields(state, trigger, graceMs, true, 'shutdown_forced'),
@@ -243,27 +295,19 @@ export function installShutdownHandlers(options: ShutdownOptions): ShutdownContr
   };
 
   const onSigint = () => {
-    if (state.phase === ShutdownPhase.Running) {
-      void begin(ShutdownTrigger.Sigint);
-      return;
-    }
-    requestForce(ShutdownTrigger.Sigint);
+    if (state.phase === ShutdownPhase.Running) void begin(ShutdownTrigger.Sigint);
+    else requestForce(ShutdownTrigger.Sigint);
   };
 
   const onSigterm = () => {
-    if (state.phase === ShutdownPhase.Running) {
-      void begin(ShutdownTrigger.Sigterm);
-      return;
-    }
-    requestForce(ShutdownTrigger.Sigterm);
+    if (state.phase === ShutdownPhase.Running) void begin(ShutdownTrigger.Sigterm);
+    else requestForce(ShutdownTrigger.Sigterm);
   };
 
   const onEof = () => requestForce(ShutdownTrigger.StdinEof);
 
   const armInteractiveEof = () => {
-    if (eofArmed) {
-      return;
-    }
+    if (eofArmed) return;
     eofArmed = true;
     stdin.once('end', onEof);
     if (stdin.readableFlowing !== true) {
@@ -273,9 +317,7 @@ export function installShutdownHandlers(options: ShutdownOptions): ShutdownContr
   };
 
   function begin(trigger: ShutdownTrigger): Promise<ShutdownOutcome> {
-    if (completionPromise) {
-      return completionPromise;
-    }
+    if (completionPromise) return completionPromise;
 
     const first = transition(state, trigger);
     state = first.state;
@@ -293,11 +335,11 @@ export function installShutdownHandlers(options: ShutdownOptions): ShutdownContr
         logFields(state, trigger, graceMs, false, 'shutdown_force_available'),
         'press Ctrl-C again or Ctrl-D to force shutdown',
       );
+      // Deliberately arm stdin only after the first interactive SIGINT.
       armInteractiveEof();
     }
 
     timer = setTimeout(() => requestForce(ShutdownTrigger.Timeout), graceMs);
-    timer.unref();
 
     completionPromise = (async () => {
       let forced = false;
@@ -323,7 +365,11 @@ export function installShutdownHandlers(options: ShutdownOptions): ShutdownContr
         if (result.kind === 'force') {
           forced = true;
           finalTrigger = result.trigger;
-          await options.force(result.trigger);
+          await withDeadline(
+            'force shutdown',
+            forceMs,
+            options.force(result.trigger),
+          );
         } else if (result.kind === 'graceful_error') {
           forced = true;
           failed = true;
@@ -331,18 +377,16 @@ export function installShutdownHandlers(options: ShutdownOptions): ShutdownContr
           state = { ...state, phase: ShutdownPhase.Forcing };
           options.logger.error(
             {
-              ...logFields(
-                state,
-                finalTrigger,
-                graceMs,
-                true,
-                'shutdown_failed',
-              ),
+              ...logFields(state, finalTrigger, graceMs, true, 'shutdown_failed'),
               ...errorValue(result.error),
             },
             'graceful shutdown failed; forcing active connections closed',
           );
-          await options.force(finalTrigger);
+          await withDeadline(
+            'force shutdown',
+            forceMs,
+            options.force(finalTrigger),
+          );
         } else {
           state = transition(state, ShutdownTrigger.GracefulComplete).state;
         }
@@ -350,13 +394,7 @@ export function installShutdownHandlers(options: ShutdownOptions): ShutdownContr
         failed = true;
         options.logger.error(
           {
-            ...logFields(
-              state,
-              finalTrigger,
-              graceMs,
-              forced,
-              'shutdown_failed',
-            ),
+            ...logFields(state, finalTrigger, graceMs, forced, 'shutdown_failed'),
             ...errorValue(error),
           },
           'server shutdown operation failed',
@@ -364,19 +402,13 @@ export function installShutdownHandlers(options: ShutdownOptions): ShutdownContr
       }
 
       try {
-        await flush();
+        await withDeadline('telemetry flush', forceMs, flushOnce());
       } catch (error) {
         failed = true;
         finalTrigger = 'cleanup_error';
         options.logger.error(
           {
-            ...logFields(
-              state,
-              finalTrigger,
-              graceMs,
-              forced,
-              'shutdown_failed',
-            ),
+            ...logFields(state, finalTrigger, graceMs, forced, 'shutdown_failed'),
             ...errorValue(error),
           },
           'shutdown cleanup or telemetry flush failed',
@@ -388,13 +420,7 @@ export function installShutdownHandlers(options: ShutdownOptions): ShutdownContr
       state = { ...state, phase: ShutdownPhase.Complete };
       options.logger.info(
         {
-          ...logFields(
-            state,
-            finalTrigger,
-            graceMs,
-            forced,
-            'shutdown_complete',
-          ),
+          ...logFields(state, finalTrigger, graceMs, forced, 'shutdown_complete'),
           failed,
         },
         forced ? 'forceful shutdown complete' : 'graceful shutdown complete',
@@ -410,6 +436,7 @@ export function installShutdownHandlers(options: ShutdownOptions): ShutdownContr
 
   processRef.on('SIGINT', onSigint);
   processRef.on('SIGTERM', onSigterm);
+  // No stdin listener or resume call is installed here.
 
   return {
     begin,

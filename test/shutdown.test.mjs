@@ -43,14 +43,46 @@ function stdinWithTTY(isTTY) {
   return stdin;
 }
 
-test('TTY first SIGINT drains and the second SIGINT forces', () => {
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+test('TTY first SIGINT drains and second SIGINT forces with two signals', () => {
   const first = transition(initialState(true), ShutdownTrigger.Sigint);
   assert.equal(first.action, ShutdownAction.BeginGraceful);
   assert.equal(first.showForceHint, true);
+  assert.equal(first.state.signalCount, 1);
 
   const second = transition(first.state, ShutdownTrigger.Sigint);
   assert.equal(second.action, ShutdownAction.Force);
   assert.equal(second.state.phase, ShutdownPhase.Forcing);
+  assert.equal(second.state.signalCount, 2);
+});
+
+test('installing the controller leaves TTY stdin untouched until SIGINT', async () => {
+  const processRef = new EventEmitter();
+  const stdin = stdinWithTTY(true);
+  const drain = deferred();
+  const controller = installShutdownHandlers({
+    processRef,
+    stdin,
+    logger: logger(),
+    graceMs: 5_000,
+    graceful: async () => drain.promise,
+    force: async () => undefined,
+  });
+
+  assert.equal(stdin.readableFlowing, null);
+  assert.equal(stdin.listenerCount('end'), 0);
+  stdin.emit('end');
+  await tick();
+  assert.equal(controller.state.phase, ShutdownPhase.Running);
+
+  processRef.emit('SIGINT');
+  await tick();
+  assert.equal(controller.state.phase, ShutdownPhase.Draining);
+  assert.equal(stdin.listenerCount('end'), 1);
+  assert.equal(stdin.readableFlowing, true);
+  controller.dispose();
+  drain.resolve();
 });
 
 test('runtime drains once, force-closes on second SIGINT, and flushes once', async () => {
@@ -78,7 +110,7 @@ test('runtime drains once, force-closes on second SIGINT, and flushes once', asy
   });
 
   processRef.emit('SIGINT');
-  await new Promise((resolve) => setImmediate(resolve));
+  await tick();
   assert.equal(controller.state.phase, ShutdownPhase.Draining);
   assert.deepEqual(calls, ['graceful:sigint']);
   assert.equal(
@@ -96,25 +128,30 @@ test('runtime drains once, force-closes on second SIGINT, and flushes once', asy
     failed: false,
   });
   assert.deepEqual(calls, ['graceful:sigint', 'force:sigint', 'flush']);
+  assert.equal(
+    logs.find((entry) => entry.fields.event === 'shutdown_forced').fields.signal_count,
+    2,
+  );
 });
 
-test('TTY Ctrl-D after the first SIGINT is the alternate force action', async () => {
+test('TTY Ctrl-D after first SIGINT is alternate force action, not a signal', async () => {
   const processRef = new EventEmitter();
   const stdin = stdinWithTTY(true);
   const drain = deferred();
   const calls = [];
+  const logs = [];
 
   const controller = installShutdownHandlers({
     processRef,
     stdin,
-    logger: logger(),
+    logger: logger(logs),
     graceMs: 5_000,
     graceful: async () => drain.promise,
     force: async (trigger) => calls.push(trigger),
   });
 
   processRef.emit('SIGINT');
-  await new Promise((resolve) => setImmediate(resolve));
+  await tick();
   stdin.end();
 
   const outcome = await controller.completion;
@@ -122,17 +159,49 @@ test('TTY Ctrl-D after the first SIGINT is the alternate force action', async ()
   assert.equal(outcome.forced, true);
   assert.equal(outcome.trigger, ShutdownTrigger.StdinEof);
   assert.deepEqual(calls, [ShutdownTrigger.StdinEof]);
+  assert.equal(
+    logs.find((entry) => entry.fields.event === 'shutdown_forced').fields.signal_count,
+    1,
+  );
+});
+
+test('TTY SIGTERM needs one signal and never arms stdin EOF', async () => {
+  const processRef = new EventEmitter();
+  const stdin = stdinWithTTY(true);
+  const logs = [];
+  const controller = installShutdownHandlers({
+    processRef,
+    stdin,
+    logger: logger(logs),
+    graceful: async () => undefined,
+    force: async () => assert.fail('must not force'),
+  });
+
+  processRef.emit('SIGTERM');
+  const outcome = await controller.completion;
+  assert.deepEqual(outcome, {
+    forced: false,
+    trigger: ShutdownTrigger.Sigterm,
+    failed: false,
+  });
+  assert.equal(stdin.listenerCount('end'), 0);
+  assert.equal(stdin.readableFlowing, null);
+  assert.equal(
+    logs.find((entry) => entry.fields.event === 'shutdown_requested').fields.signal_count,
+    1,
+  );
 });
 
 test('non-TTY SIGTERM needs one signal and completes gracefully', async () => {
   const processRef = new EventEmitter();
   const stdin = stdinWithTTY(false);
   let flushCount = 0;
+  const logs = [];
 
   const controller = installShutdownHandlers({
     processRef,
     stdin,
-    logger: logger(),
+    logger: logger(logs),
     graceMs: 5_000,
     graceful: async () => undefined,
     force: async () => assert.fail('must not force'),
@@ -151,6 +220,12 @@ test('non-TTY SIGTERM needs one signal and completes gracefully', async () => {
   });
   assert.equal(flushCount, 1);
   assert.equal(controller.state.phase, ShutdownPhase.Complete);
+  assert.equal(stdin.listenerCount('end'), 0);
+  assert.equal(stdin.readableFlowing, null);
+  assert.equal(
+    logs.find((entry) => entry.fields.event === 'shutdown_complete').fields.signal_count,
+    1,
+  );
 });
 
 test('grace deadline force-closes a stalled non-TTY drain', async () => {
@@ -158,13 +233,14 @@ test('grace deadline force-closes a stalled non-TTY drain', async () => {
   const stdin = stdinWithTTY(false);
   const drain = deferred();
   const calls = [];
+  const logs = [];
   const keepAlive = setTimeout(() => undefined, 1_000);
 
   try {
     const controller = installShutdownHandlers({
       processRef,
       stdin,
-      logger: logger(),
+      logger: logger(logs),
       graceMs: 20,
       graceful: async () => drain.promise,
       force: async (trigger) => calls.push(trigger),
@@ -177,7 +253,34 @@ test('grace deadline force-closes a stalled non-TTY drain', async () => {
     assert.equal(outcome.forced, true);
     assert.equal(outcome.trigger, ShutdownTrigger.Timeout);
     assert.deepEqual(calls, [ShutdownTrigger.Timeout]);
+    assert.equal(
+      logs.find((entry) => entry.fields.event === 'shutdown_forced').fields.signal_count,
+      1,
+    );
   } finally {
     clearTimeout(keepAlive);
   }
+});
+
+test('force and telemetry hooks that never settle are bounded', async () => {
+  const processRef = new EventEmitter();
+  const stdin = stdinWithTTY(true);
+  const never = new Promise(() => undefined);
+  const controller = installShutdownHandlers({
+    processRef,
+    stdin,
+    logger: logger(),
+    graceMs: 5_000,
+    forceMs: 5,
+    graceful: async () => never,
+    force: async () => never,
+    flush: async () => never,
+  });
+
+  processRef.emit('SIGINT');
+  await tick();
+  processRef.emit('SIGINT');
+  const outcome = await controller.completion;
+  assert.equal(outcome.forced, true);
+  assert.equal(outcome.failed, true);
 });
