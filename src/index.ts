@@ -3,6 +3,7 @@
 import { shutdownTelemetry } from './telemetry';
 
 import Fastify from 'fastify';
+import { installShutdownHandlers } from './shutdown';
 import {
   configuredProviders,
   generateScript,
@@ -151,40 +152,22 @@ const start = async () => {
   }
 };
 
-// How long to let in-flight work finish before exiting anyway. Keep this below
-// the pod's terminationGracePeriodSeconds so we exit on our own terms rather
-// than being SIGKILLed.
-const SHUTDOWN_GRACE_MS = Number(process.env.SHUTDOWN_GRACE_MS ?? 10_000);
-
-// Drain in-flight requests, then flush telemetry, on k8s pod stop.
-//
-// The drain is bounded: `fastify.close()` waits for open connections to go
-// idle, and a client that never reads its response body keeps one active
-// indefinitely. Without a deadline a single such client would hold the pod open
-// until the kubelet SIGKILLed it, stalling every rolling update.
-const shutdown = async (signal: string) => {
-  fastify.log.info(`${signal} received; shutting down`);
-
-  const forceExit = setTimeout(() => {
-    fastify.log.warn(
-      { graceMs: SHUTDOWN_GRACE_MS },
-      'grace period elapsed with connections still open; exiting anyway',
-    );
-    process.exit(0);
-  }, SHUTDOWN_GRACE_MS);
-  // Do not let the timer itself keep the event loop alive.
-  forceExit.unref();
-
-  try {
+installShutdownHandlers({
+  logger: fastify.log,
+  graceful: async () => {
+    // Fastify delegates to http.Server.close(): stop accepting new work and
+    // wait for in-flight requests to complete.
     await fastify.close();
-  } finally {
-    clearTimeout(forceExit);
-    await shutdownTelemetry();
-    process.exit(0);
-  }
-};
-
-process.once('SIGTERM', () => void shutdown('SIGTERM'));
-process.once('SIGINT', () => void shutdown('SIGINT'));
+  },
+  force: () => {
+    // Node >=18.2 exposes the force path directly. This is intentionally not
+    // called during ordinary graceful shutdown.
+    fastify.server.closeAllConnections();
+  },
+  flush: shutdownTelemetry,
+  onComplete: ({ failed }) => {
+    process.exitCode = failed ? 1 : 0;
+  },
+});
 
 void start();
