@@ -7,6 +7,7 @@ import { google } from 'googleapis';
 import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
+import { withSpan } from './telemetry';
 
 /** YouTube is configured but the request cannot be served as asked. */
 export class YouTubePublishError extends Error {
@@ -155,39 +156,50 @@ let verifiedChannel: ChannelIdentity | undefined;
 export async function verifyChannel(): Promise<ChannelIdentity> {
   if (verifiedChannel) return verifiedChannel;
 
-  const youtube = getYouTube();
-  const res = await youtube.channels.list({ part: ['id', 'snippet'], mine: true });
-  const channel = res.data.items?.[0];
-  if (!channel?.id) {
-    throw new YouTubePublishError('credentials own no YouTube channel', 503);
-  }
+  return withSpan(
+    'act.youtube.channel.verify',
+    {
+      'act.youtube.expected_channel.configured': Boolean(
+        EXPECTED_CHANNEL_ID || EXPECTED_CHANNEL_HANDLE,
+      ),
+    },
+    async (span) => {
+      const youtube = getYouTube();
+      const res = await youtube.channels.list({ part: ['id', 'snippet'], mine: true });
+      const channel = res.data.items?.[0];
+      if (!channel?.id) {
+        throw new YouTubePublishError('credentials own no YouTube channel', 503);
+      }
 
-  const identity: ChannelIdentity = {
-    id: channel.id,
-    title: channel.snippet?.title ?? '',
-    handle: channel.snippet?.customUrl ?? undefined,
-  };
+      const identity: ChannelIdentity = {
+        id: channel.id,
+        title: channel.snippet?.title ?? '',
+        handle: channel.snippet?.customUrl ?? undefined,
+      };
 
-  const normalize = (value: string) => value.replace(/^@/, '').toLowerCase();
-  const idMismatch = EXPECTED_CHANNEL_ID && EXPECTED_CHANNEL_ID !== identity.id;
-  const handleMismatch =
-    EXPECTED_CHANNEL_HANDLE &&
-    identity.handle &&
-    normalize(EXPECTED_CHANNEL_HANDLE) !== normalize(identity.handle);
+      const normalize = (value: string) => value.replace(/^@/, '').toLowerCase();
+      const idMismatch = EXPECTED_CHANNEL_ID && EXPECTED_CHANNEL_ID !== identity.id;
+      const handleMismatch =
+        EXPECTED_CHANNEL_HANDLE &&
+        identity.handle &&
+        normalize(EXPECTED_CHANNEL_HANDLE) !== normalize(identity.handle);
 
-  if (idMismatch || handleMismatch) {
-    // Names the channel we landed on so the mixup is obvious, but refuses to
-    // upload. Publishing to the wrong channel is not recoverable by deleting.
-    throw new YouTubePublishError(
-      `credentials belong to a different channel: got ${identity.id}` +
-        `${identity.handle ? ` (${identity.handle})` : ''}, expected ` +
-        `${EXPECTED_CHANNEL_ID || EXPECTED_CHANNEL_HANDLE}`,
-      503,
-    );
-  }
+      if (idMismatch || handleMismatch) {
+        // Names the channel we landed on so the mixup is obvious, but refuses to
+        // upload. Publishing to the wrong channel is not recoverable by deleting.
+        throw new YouTubePublishError(
+          `credentials belong to a different channel: got ${identity.id}` +
+            `${identity.handle ? ` (${identity.handle})` : ''}, expected ` +
+            `${EXPECTED_CHANNEL_ID || EXPECTED_CHANNEL_HANDLE}`,
+          503,
+        );
+      }
 
-  verifiedChannel = identity;
-  return identity;
+      span.setAttribute('act.youtube.channel.match', true);
+      verifiedChannel = identity;
+      return identity;
+    },
+  );
 }
 
 /** Forget the cached identity. Tests use this; production never needs it. */
@@ -208,54 +220,72 @@ export async function uploadToYouTube(
   description: string,
   options: UploadOptions = {},
 ): Promise<string> {
-  const youtube = getYouTube();
-  // Identity first: a path that resolves is no use if the token points at the
-  // wrong channel.
-  await verifyChannel();
-  const resolved = await resolveUploadPath(filePath);
-  const { size } = await fsp.stat(resolved);
-
-  const privacyStatus = options.privacyStatus ?? process.env.YOUTUBE_PRIVACY_STATUS ?? 'private';
-  if (!PRIVACY_STATUSES.has(privacyStatus)) {
-    // Caught here rather than as an opaque 400 from Google, and defaulting to
-    // `private` means a typo can never accidentally publish publicly.
-    throw new YouTubePublishError(
-      `invalid privacyStatus "${privacyStatus}" (expected private, unlisted, or public)`,
-      400,
-    );
-  }
-
-  let lastLoggedDecile = -1;
-  const res = await youtube.videos.insert(
+  return withSpan(
+    'act.youtube.video.upload',
     {
-      part: ['snippet', 'status'],
-      requestBody: {
-        snippet: {
-          title,
-          description,
-          tags: options.tags ?? ['AI', 'Automation', 'Generated'],
-          categoryId: options.categoryId ?? '28', // Science & Technology
-        },
-        status: { privacyStatus, selfDeclaredMadeForKids: false },
-      },
-      media: { body: fs.createReadStream(resolved) },
+      'act.youtube.title.characters': title.length,
+      'act.youtube.description.characters': description.length,
+      'act.youtube.tags.count': options.tags?.length ?? 3,
     },
-    {
-      onUploadProgress: (evt) => {
-        // Log per decile, not per chunk: a multi-GB upload otherwise emits
-        // thousands of lines and buries everything else in the pod log.
-        const decile = Math.floor((evt.bytesRead / size) * 10);
-        if (decile > lastLoggedDecile) {
-          lastLoggedDecile = decile;
-          console.log('YouTube upload progress', { percent: decile * 10 });
-        }
-      },
+    async (span) => {
+      const youtube = getYouTube();
+      // Identity first: a path that resolves is no use if the token points at the
+      // wrong channel.
+      await verifyChannel();
+      const resolved = await resolveUploadPath(filePath);
+      const { size } = await fsp.stat(resolved);
+
+      const privacyStatus = options.privacyStatus ?? process.env.YOUTUBE_PRIVACY_STATUS ?? 'private';
+      if (!PRIVACY_STATUSES.has(privacyStatus)) {
+        // Caught here rather than as an opaque 400 from Google, and defaulting to
+        // `private` means a typo can never accidentally publish publicly.
+        throw new YouTubePublishError(
+          `invalid privacyStatus "${privacyStatus}" (expected private, unlisted, or public)`,
+          400,
+        );
+      }
+
+      span.setAttribute('act.youtube.upload.bytes', size);
+      span.setAttribute('act.youtube.privacy_status', privacyStatus);
+
+      let lastLoggedDecile = -1;
+      const res = await youtube.videos.insert(
+        {
+          part: ['snippet', 'status'],
+          requestBody: {
+            snippet: {
+              title,
+              description,
+              tags: options.tags ?? ['AI', 'Automation', 'Generated'],
+              categoryId: options.categoryId ?? '28', // Science & Technology
+            },
+            status: { privacyStatus, selfDeclaredMadeForKids: false },
+          },
+          media: { body: fs.createReadStream(resolved) },
+        },
+        {
+          onUploadProgress: (evt) => {
+            // Log per decile, not per chunk: a multi-GB upload otherwise emits
+            // thousands of lines and buries everything else in the pod log.
+            const decile = Math.floor((evt.bytesRead / size) * 10);
+            if (decile > lastLoggedDecile) {
+              lastLoggedDecile = decile;
+              const percent = decile * 10;
+              console.log('YouTube upload progress', { percent });
+              span.addEvent('act.youtube.upload.progress', {
+                'act.youtube.upload.percent': percent,
+              });
+            }
+          },
+        },
+      );
+
+      const videoId = res.data.id;
+      if (!videoId) throw new YouTubePublishError('upload returned no video id', 502);
+      span.setAttribute('act.youtube.video_id.present', true);
+      return videoId;
     },
   );
-
-  const videoId = res.data.id;
-  if (!videoId) throw new YouTubePublishError('upload returned no video id', 502);
-  return videoId;
 }
 
 /**
