@@ -12,6 +12,6 @@ permissions:
 
 jobs:
   source-policy:
-    uses: ores-otel/.github/.github/workflows/source-policy-lint.yml@b5a502d4e69ead9f0e595df54fc267d23a4fe889
+    uses: ores-otel/.github/.github/workflows/source-policy-lint.yml@1d9aa4fbf1daf6b1aa70c2c2afe3cc591b0dabf7
     permissions:
       contents: read
