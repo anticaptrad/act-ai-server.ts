@@ -17,11 +17,28 @@
           inherit system;
           overlays = [ ores-sops.overlays.default ];
         };
+        agentCheck = pkgs.writeShellScriptBin "agent-check"
+          (builtins.readFile ./agent-check.sh);
       in
       {
+        checks.agent-check-policy = pkgs.runCommand "act-ai-agent-check-policy" {
+          nativeBuildInputs = [ pkgs.nodejs_22 pkgs.shellcheck ];
+        } ''
+          shellcheck ${./agent-check.sh}
+          node -e '
+            const fs = require("node:fs");
+            const pkg = JSON.parse(fs.readFileSync("${../package.json}", "utf8"));
+            const lock = JSON.parse(fs.readFileSync("${../package-lock.json}", "utf8"));
+            if (pkg.name !== lock.name || pkg.version !== lock.version) process.exit(1);
+          '
+          touch "$out"
+        '';
+
         devShells.default = pkgs.mkShell {
           name = "act-ai-server.ts";
           packages = with pkgs; [
+            agentCheck
+            nodejs_22
             python3
             # Qualified deliberately: `with pkgs;` does not shadow the outputs
             # function's arguments, so a bare `ores-sops` would resolve to the
@@ -34,6 +51,7 @@
             just
             git
             direnv
+            shellcheck
           ];
 
           # Installs the merge/checkout refresh hooks and re-decrypts the active
