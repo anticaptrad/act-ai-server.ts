@@ -1,0 +1,58 @@
+name: Nix agent environment
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - flake.nix
+      - flake.lock
+      - .nix/**
+      - package.json
+      - package-lock.json
+      - src/**
+      - test/**
+      - .github/workflows/nix.yml
+  pull_request:
+    paths:
+      - flake.nix
+      - flake.lock
+      - .nix/**
+      - package.json
+      - package-lock.json
+      - src/**
+      - test/**
+      - .github/workflows/nix.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  agent-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Verify the committed lock without updating inputs
+        run: nix flake metadata --no-update-lock-file
+
+      - name: Check the flake without updating inputs
+        run: nix flake check --no-update-lock-file --show-trace
+
+      - name: Run the non-interactive repository baseline
+        run: nix develop --no-update-lock-file -c agent-check
