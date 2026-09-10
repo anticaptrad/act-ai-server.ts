@@ -18,6 +18,7 @@
     "@opentelemetry/exporter-trace-otlp-http": "^0.54.0",
     "@opentelemetry/sdk-node": "^0.54.0",
     "@opentelemetry/sdk-trace-node": "^1.27.0",
+    "@oresoftware/ores-middleware": "git+https://github.com/ORESoftware/ores-middleware.git#88f41bc2d55f94dae03dd392800cc740bdc49480",
     "fastify": "^4.28.1",
     "google-auth-library": "^9.14.1",
     "googleapis": "^144.0.0",
