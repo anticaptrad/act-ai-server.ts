@@ -1,0 +1,38 @@
+name: ORES middleware Node rollout
+
+on:
+  push:
+    branches: ["DEN-3959/ores-middleware-node"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm install --ignore-scripts=false --no-audit --no-fund
+      - name: Commit immutable lock on rollout branch
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          grep -F '88f41bc2d55f94dae03dd392800cc740bdc49480' package-lock.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add package-lock.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'deps(DEN-3959): lock ORES middleware Git package'
+            git push origin HEAD:${GITHUB_REF_NAME}
+          fi
+      - run: npm run typecheck
+      - run: npm test
