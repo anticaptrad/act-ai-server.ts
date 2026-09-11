@@ -1,5 +1,5 @@
-// Telemetry must be imported first so auto-instrumentation patches modules
-// (http, etc.) before Fastify and the SDKs require them.
+// Initialize the tracer provider before route modules create explicit spans.
+// No OpenTelemetry auto-instrumentation or module patching is installed.
 import { shutdownTelemetry } from './telemetry';
 
 import Fastify from 'fastify';

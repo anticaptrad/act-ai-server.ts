@@ -11,6 +11,7 @@
 import OpenAI from 'openai';
 import Anthropic from '@anthropic-ai/sdk';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { withSpan } from './telemetry';
 
 export type Provider = 'openai' | 'anthropic' | 'gemini' | 'grok';
 
@@ -75,45 +76,78 @@ export function configuredProviders(): Provider[] {
   return configured;
 }
 
+function modelForProvider(provider: Provider): string {
+  switch (provider) {
+    case 'openai':
+      return OPENAI_MODEL;
+    case 'anthropic':
+      return ANTHROPIC_MODEL;
+    case 'gemini':
+      return GEMINI_MODEL;
+    case 'grok':
+      return GROK_MODEL;
+  }
+}
+
 /** Route the prompt to the requested LLM and return the generated video script. */
 export async function generateScript(topic: string, provider: Provider): Promise<string> {
   const prompt = `Write a compelling 60-second video script about: ${topic}. Include visual cues.`;
+  const model = modelForProvider(provider);
 
-  switch (provider) {
-    case 'openai': {
-      const response = await getOpenAI().chat.completions.create({
-        model: OPENAI_MODEL,
-        messages: [{ role: 'user', content: prompt }],
-      });
-      return response.choices[0]?.message.content ?? '';
-    }
-    case 'anthropic': {
-      const response = await getAnthropic().messages.create({
-        model: ANTHROPIC_MODEL,
-        max_tokens: 1024,
-        messages: [{ role: 'user', content: prompt }],
-      });
-      // Guard against safety refusals (stop_reason: "refusal") before reading content.
-      // Cast: older SDK typings don't yet include the "refusal" stop reason.
-      if ((response.stop_reason as string) === 'refusal') {
-        throw new Error('Anthropic declined the request');
+  return withSpan(
+    'act.ai.script.generate',
+    {
+      'act.ai.provider': provider,
+      'act.ai.model': model,
+      'act.ai.topic.characters': topic.length,
+      'act.ai.prompt.characters': prompt.length,
+    },
+    async (span) => {
+      let script: string;
+
+      switch (provider) {
+        case 'openai': {
+          const response = await getOpenAI().chat.completions.create({
+            model,
+            messages: [{ role: 'user', content: prompt }],
+          });
+          script = response.choices[0]?.message.content ?? '';
+          break;
+        }
+        case 'anthropic': {
+          const response = await getAnthropic().messages.create({
+            model,
+            max_tokens: 1024,
+            messages: [{ role: 'user', content: prompt }],
+          });
+          // Guard against safety refusals (stop_reason: "refusal") before reading content.
+          // Cast: older SDK typings don't yet include the "refusal" stop reason.
+          if ((response.stop_reason as string) === 'refusal') {
+            throw new Error('Anthropic declined the request');
+          }
+          const block = response.content[0];
+          script = block && block.type === 'text' ? block.text : '';
+          break;
+        }
+        case 'gemini': {
+          const geminiModel = getGemini().getGenerativeModel({ model });
+          const response = await geminiModel.generateContent(prompt);
+          script = response.response.text();
+          break;
+        }
+        case 'grok': {
+          const response = await getGrok().chat.completions.create({
+            model,
+            messages: [{ role: 'user', content: prompt }],
+          });
+          script = response.choices[0]?.message.content ?? '';
+          break;
+        }
       }
-      const block = response.content[0];
-      return block && block.type === 'text' ? block.text : '';
-    }
-    case 'gemini': {
-      const model = getGemini().getGenerativeModel({ model: GEMINI_MODEL });
-      const response = await model.generateContent(prompt);
-      return response.response.text();
-    }
-    case 'grok': {
-      const response = await getGrok().chat.completions.create({
-        model: GROK_MODEL,
-        messages: [{ role: 'user', content: prompt }],
-      });
-      return response.choices[0]?.message.content ?? '';
-    }
-    default:
-      throw new Error(`Unsupported provider: ${provider as string}`);
-  }
+
+      span.setAttribute('act.ai.response.characters', script.length);
+      span.setAttribute('act.ai.response.empty', script.length === 0);
+      return script;
+    },
+  );
 }
