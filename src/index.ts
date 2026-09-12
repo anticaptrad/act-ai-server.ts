@@ -4,6 +4,7 @@ import { shutdownTelemetry } from './telemetry';
 
 import Fastify from 'fastify';
 import { installShutdownHandlers } from './shutdown';
+import { installOresMiddleware } from './ores-middleware';
 import {
   configuredProviders,
   generateScript,
@@ -20,6 +21,10 @@ import {
 } from './youtube';
 
 const fastify = Fastify({ logger: true });
+
+// ORES owns cross-cutting request context/correlation before product admission.
+// It does not replace the paid-route secret gate below.
+installOresMiddleware(fastify);
 
 // Guards every /api/* route. Registered before the routes so nothing can be
 // added later that quietly bypasses it — probes stay public because the hook
@@ -118,8 +123,6 @@ fastify.post('/api/publish/youtube', async (request, reply) => {
     return { videoId, url: `https://youtu.be/${videoId}` };
   } catch (error) {
     request.log.error(error);
-    // Distinguish "not configured", "bad request", "quota", and "credentials
-    // revoked" — they need different responses from whoever is on call.
     const { status, message } = classifyYouTubeError(error);
     return reply.status(status).send({ error: message });
   }
@@ -127,8 +130,6 @@ fastify.post('/api/publish/youtube', async (request, reply) => {
 
 const start = async () => {
   try {
-    // Surface an unconfigured publishing path once at boot rather than only on
-    // the first upload attempt.
     if (!isAuthConfigured()) {
       fastify.log.warn(
         'SERVER_AUTH_SECRET not set; /api/* will answer 503 (paid and publishing routes stay closed)',
@@ -155,13 +156,9 @@ const start = async () => {
 installShutdownHandlers({
   logger: fastify.log,
   graceful: async () => {
-    // Fastify delegates to http.Server.close(): stop accepting new work and
-    // wait for in-flight requests to complete.
     await fastify.close();
   },
   force: () => {
-    // Node >=18.2 exposes the force path directly. This is intentionally not
-    // called during ordinary graceful shutdown.
     fastify.server.closeAllConnections();
   },
   flush: shutdownTelemetry,
